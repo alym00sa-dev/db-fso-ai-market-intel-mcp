@@ -2,6 +2,8 @@ import os
 
 from fastmcp import FastMCP
 
+from server import analysis, retrieval
+
 mcp = FastMCP("fso-ai-market-intel-mcp")
 
 
@@ -9,6 +11,13 @@ mcp = FastMCP("fso-ai-market-intel-mcp")
 def health() -> str:
     """Report that the server is up and reachable."""
     return "ok"
+
+
+mcp.tool(retrieval.list_datasets)
+mcp.tool(retrieval.describe_dataset)
+mcp.tool(retrieval.query_dataset)
+mcp.tool(analysis.model_roi)
+mcp.tool(analysis.perception_vs_performance)
 
 
 def main() -> None:
