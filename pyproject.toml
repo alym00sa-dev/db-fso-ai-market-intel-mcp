@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Custom MCP server for AI Market Intelligence, hosted as a Databricks App"
 requires-python = ">=3.11"
 dependencies = [
-    "mcp",
+    "fastmcp",
     "databricks-sdk",
 ]
 
