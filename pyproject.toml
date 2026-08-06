@@ -1,0 +1,19 @@
+[project]
+name = "fso-ai-market-intel-mcp"
+version = "0.1.0"
+description = "Custom MCP server for AI Market Intelligence, hosted as a Databricks App"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp",
+    "databricks-sdk",
+]
+
+[project.scripts]
+custom-server = "server.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["server"]
