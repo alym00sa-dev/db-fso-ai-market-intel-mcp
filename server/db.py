@@ -15,7 +15,6 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from functools import lru_cache
 from typing import Any
 
 from databricks.sdk import WorkspaceClient
@@ -25,12 +24,15 @@ from databricks.sdk.service.sql import (
     StatementParameterListItem,
     StatementState,
 )
+from fastmcp.server.dependencies import get_http_headers
 
 logger = logging.getLogger("fso_ai_market_intel_mcp.db")
 
 _POLL_INTERVAL_SECONDS = 1.0
 _MAX_WAIT_SECONDS = 60.0
 _WAREHOUSE_ID_ENV_VAR = "DATABRICKS_WAREHOUSE_ID"
+_APP_NAME_ENV_VAR = "DATABRICKS_APP_NAME"
+_FORWARDED_TOKEN_HEADER = "x-forwarded-access-token"
 
 
 class QueryError(RuntimeError):
@@ -46,12 +48,27 @@ class QueryResult:
         return [dict(zip(self.columns, row)) for row in self.rows]
 
 
-@lru_cache(maxsize=1)
 def _client() -> WorkspaceClient:
-    return WorkspaceClient()
+    """Build a WorkspaceClient authenticated as the calling end user.
+
+    Deployed as a Databricks App, each request must be authenticated with the
+    calling user's own forwarded token — never a cached client — so that one
+    user's query cannot run under another user's identity. Locally (no
+    DATABRICKS_APP_NAME), there is no forwarded token to read, so fall back to
+    the developer's own Databricks CLI auth.
+    """
+    if not os.environ.get(_APP_NAME_ENV_VAR):
+        return WorkspaceClient()
+
+    token = get_http_headers().get(_FORWARDED_TOKEN_HEADER)
+    if not token:
+        raise QueryError(
+            f"Missing required '{_FORWARDED_TOKEN_HEADER}' header. "
+            "This app must be accessed through Databricks Apps on-behalf-of-user auth."
+        )
+    return WorkspaceClient(token=token, auth_type="pat")
 
 
-@lru_cache(maxsize=1)
 def _actor() -> str:
     """Best-effort identity for audit logging. Never blocks a query on failure."""
     try:
