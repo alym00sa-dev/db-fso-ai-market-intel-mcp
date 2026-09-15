@@ -2,7 +2,7 @@ import os
 
 from fastmcp import FastMCP
 
-from server import analysis, compute_fit, retrieval, scorecard
+from server import analysis, compute_fit, equity, retrieval, scorecard
 
 INSTRUCTIONS = """\
 AI Market Intelligence over fso_market_intelligence.frontier_labs (16 datasets).
@@ -10,8 +10,9 @@ Three kinds of tools — use the cheapest one that answers the question:
 
 1. Query (list_datasets, describe_dataset, query_dataset) — conversational access
    to any of the 16 datasets. Start here for "what does the data say about X".
-2. Deterministic calculators (compute_fit, cost_efficiency_frontier, model_roi) —
-   reproducible math. Same inputs always give the same answer.
+2. Deterministic calculators (compute_fit, capability_cost_pareto,
+   regional_equity_scores) — reproducible math. Same inputs always give the same
+   answer.
 3. Analyses (model_scorecard) — cross-source triangulation with deterministic
    joins/flags; treat the flags as a starting point for your own interpretation,
    not a final verdict.
@@ -31,9 +32,10 @@ Known caveats, always worth surfacing to the user:
 For the two flagship L3 reads, follow the orchestration playbooks in this repo's
 recipes/ folder rather than improvising the structure: recipes/model_scorecard.md
 (how to turn a model_scorecard() call into a stakeholder-ready read) and
-recipes/global_equity_representation.md (how to weave SAHARA + GIRAI + Oxford into a
-regional/language equity read — there's no single tool for this, it's a multi-call
-orchestration).
+recipes/global_equity_representation.md (how to weave regional_equity_scores +
+SAHARA into a regional/language equity read — regional_equity_scores supplies the
+deterministic readiness/responsibility-by-region join, but the language-coverage
+and open-vs-closed matching steps are still a multi-call orchestration, not one tool).
 """
 
 mcp = FastMCP("fso-ai-market-intel-mcp", instructions=INSTRUCTIONS)
@@ -48,9 +50,9 @@ def health() -> str:
 mcp.tool(retrieval.list_datasets)
 mcp.tool(retrieval.describe_dataset)
 mcp.tool(retrieval.query_dataset)
-mcp.tool(analysis.model_roi)
-mcp.tool(analysis.cost_efficiency_frontier)
+mcp.tool(analysis.capability_cost_pareto)
 mcp.tool(compute_fit.compute_fit)
+mcp.tool(equity.regional_equity_scores)
 mcp.tool(scorecard.model_scorecard)
 
 

@@ -1,8 +1,7 @@
 """Fixed analysis tools: the value-add layer over plain retrieval.
 
-model_roi ranks frontier models by capability-per-dollar from
-model_benchmarks. cost_efficiency_frontier finds the Pareto-optimal models on
-capability vs cost.
+capability_cost_pareto finds the Pareto-optimal models on capability vs
+per-1M-token price.
 """
 
 from __future__ import annotations
@@ -13,62 +12,14 @@ from server import retrieval
 from server.stats import to_float as _to_float
 
 __all__ = [
-    "model_roi",
-    "cost_efficiency_frontier",
+    "capability_cost_pareto",
 ]
 
 
-def model_roi(
+def capability_cost_pareto(
     model_column: str = "name",
     score_column: str = "intelligence_index",
-    price_column: str = "price_blended_3to1",
-    limit: int = 50,
-) -> dict[str, Any]:
-    """Rank frontier models by capability-per-dollar (score_column / price_column).
-
-    Reads model_benchmarks. Rows missing a score or price, or with a
-    non-positive price, are skipped rather than distorting the ranking.
-
-    Defaults match the current (premium AA) model_benchmarks schema. If your
-    warehouse uses different names, call describe_dataset('model_benchmarks')
-    and pass the correct ones via model_column/score_column/price_column. A
-    name that doesn't exist raises a clear error rather than silently
-    returning nothing.
-    """
-    data = retrieval.query_dataset(
-        "model_benchmarks",
-        columns=[model_column, score_column, price_column],
-        limit=limit,
-    )
-
-    ranked = []
-    for row in data["rows"]:
-        model = row.get(model_column)
-        score = _to_float(row.get(score_column))
-        price = _to_float(row.get(price_column))
-        if model is None or score is None or price is None or price <= 0:
-            continue
-        ranked.append(
-            {
-                "model": model,
-                "score": score,
-                "price": price,
-                "capability_per_dollar": score / price,
-            }
-        )
-
-    ranked.sort(key=lambda r: r["capability_per_dollar"], reverse=True)
-    return {
-        "score_column": score_column,
-        "price_column": price_column,
-        "ranking": ranked,
-    }
-
-
-def cost_efficiency_frontier(
-    model_column: str = "name",
-    score_column: str = "intelligence_index",
-    cost_column: str = "cost_per_task_total",
+    cost_column: str = "price_blended_3to1",
     limit: int = 200,
 ) -> dict[str, Any]:
     """Pareto frontier of capability (score_column) vs cost (cost_column).
@@ -76,10 +27,22 @@ def cost_efficiency_frontier(
     Reads model_benchmarks. A model is "on the frontier" if no other model
     is both cheaper-or-equal AND at least as capable — i.e. nothing strictly
     dominates it. Deterministic: sort by cost ascending, keep every model
-    whose score is a new best-so-far (a classic skyline scan), everything
-    else is "dominated" (some cheaper-or-equal model already matches or
-    beats its capability). Sharper than model_roi's single ratio because it
-    doesn't force capability and cost onto one linear scale.
+    whose score is a new best-so-far (a classic skyline scan) — this is the
+    step-function "highest capability at or below this cost" frontier.
+    Everything else is "dominated" (some cheaper-or-equal model already
+    matches or beats its capability).
+
+    score_column is the capability axis and can be any column in
+    model_benchmarks (e.g. intelligence_index, coding_index, gpqa_diamond) —
+    it's validated live against the warehouse schema, not hardcoded, so pass
+    whatever capability metric the question is actually about.
+
+    cost_column defaults to price_blended_3to1 — a genuine $/1M-tokens price
+    (blended 3:1 input:output ratio) — and should stay a price_* column
+    (price_input, price_output, price_blended_7to2to1 are also valid).
+    Avoid cost_per_task_total here: that's AA's $ cost to run their eval
+    suite, not a per-token price, and mixing the two would make the frontier
+    incomparable across models.
 
     Rows missing a score or cost, or with non-positive cost, are skipped.
     """

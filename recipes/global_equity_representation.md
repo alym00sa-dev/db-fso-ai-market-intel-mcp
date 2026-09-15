@@ -2,47 +2,46 @@
 
 The most mission-relevant L3 read: does frontier AI serve regions/languages equally?
 Weaves SAHARA (African-language model coverage) + GIRAI (responsibility) + Oxford
-(government readiness), sliced by region/income group via
-`girai_country_classifications`. Pure **MD orchestration** — no dedicated Python tool.
-Per `planning/00-overview.md`'s implementation model: the data pulls are grounded and
-exact (`query_dataset`), the cross-source reasoning (matching a SAHARA model name to
-its `model_benchmarks` open/closed status, connecting country-level readiness gaps to
-language coverage gaps) is Claude's job, not a reproducibility-guaranteed join — unlike
-`model_scorecard`, this narrative doesn't need a hard "same inputs → same output"
-guarantee, it needs a well-grounded story.
+(government readiness), sliced by region/income group. **Hybrid MD orchestration**:
+the region/income-group readiness+responsibility join is deterministic and pulled out
+as `server/equity.py`'s `regional_equity_scores` tool (Level 2 — same category as
+`capability_cost_pareto`); everything else (language coverage, matching SAHARA models
+to `model_benchmarks` open/closed status, and the narrative synthesis) stays Claude's
+job at query time, since the SAHARA name-match is explicitly best-effort, not a
+reproducibility-guaranteed join like `model_scorecard`'s reconciliation.
 
 ## Steps
 
-1. **Country reference frame.** `query_dataset('girai_country_classifications')` for
-   region, income group, GDP, development status. This is the join key for everything
-   country-level below — do the region/income grouping yourself from these fields
-   rather than assuming any other table pre-labels it.
-2. **Responsibility.** `query_dataset('girai_scores', ...)` (overall + dimension/pillar,
-   most recent edition — check `girai_editions_comparison` if a 2024-vs-2026 trend adds
-   something). Group by region/income group from step 1; note which
-   regions/income-groups cluster low.
-3. **Readiness.** `query_dataset('oxford_ai_readiness', ...)` (+ `oxford_readiness_dimensions`
-   for which pillar is driving a low score). Same grouping. Look for regions that are
-   low on *both* readiness and responsibility — that's a compounding gap, not two
-   separate stories.
-4. **Language coverage.** `query_dataset('sahara_leaderboard', ...)` for overall model
+1. **Readiness + responsibility, by region/income group — call `regional_equity_scores(group_by=...)`.**
+   This tool does the deterministic part: joins `girai_country_classifications`
+   (region/income/development reference) to `girai_scores` (responsibility) and
+   `oxford_ai_readiness` (readiness) by `iso3`, and returns per-group mean/min/max for
+   both scores (`group_by` can be `region`, `subregion`, `developing_status`, or
+   `wb_income_group` — pass whichever the question is actually about). Look for groups
+   that are low on *both* `girai` and `oxford` — that's a compounding gap, not two
+   separate stories. Note `n_girai`/`n_oxford` per group before trusting a mean — GIRAI
+   covers 135 countries, Oxford ~195, so a thin group (small n) shouldn't be read with
+   the same confidence as a well-populated one. For a specific country's dimension-level
+   detail (which pillar is driving a low score), drop down to `girai_pillar_dimension_scores`
+   / `oxford_readiness_dimensions` directly via `query_dataset`.
+2. **Language coverage.** `query_dataset('sahara_leaderboard', ...)` for overall model
    scores, `sahara_language_scores` for per-language detail, `sahara_task_scores` if a
    specific task matters to the question asked. Identify which African languages are
    well-covered by frontier models and which aren't.
-5. **Open vs. closed, for the African-language angle.** Pull `model_benchmarks`
+3. **Open vs. closed, for the African-language angle.** Pull `model_benchmarks`
    (`name`, `is_open_weights`, pricing) and match each SAHARA-leaderboard model to it
    by name (reuse the reasoning in `server/reconciliation.py`'s approach — lowercase,
    strip trailing parenthetical, don't force a match you're not confident in). For
    models you can confidently match, identify the best-performing **open-weight**
    model on African languages vs. the best-performing model overall, and the cost gap
-   (`model_roi` or `cost_efficiency_frontier` can supply the cost side). State
-   unmatched models explicitly rather than silently excluding them from the read.
-6. **Synthesize.** Connect the three layers: do the regions/income-groups with weak
-   government AI readiness and weak responsibility scores (steps 2–3) also have weak
-   language coverage from frontier models (step 4)? Is the best African-language
-   model open-weight (accessible to those regions without a large compute/API budget)
-   or closed (a cost barrier compounding the readiness gap)? That intersection — not
-   any single table — is the point of this tool.
+   (`capability_cost_pareto` can supply the cost side). State unmatched models
+   explicitly rather than silently excluding them from the read.
+4. **Synthesize.** Connect the layers: do the regions/income-groups `regional_equity_scores`
+   flagged as weak on readiness+responsibility (step 1) also have weak language coverage
+   from frontier models (step 2)? Is the best African-language model open-weight
+   (accessible to those regions without a large compute/API budget) or closed (a cost
+   barrier compounding the readiness gap)? That intersection — not any single table —
+   is the point of this read.
 
 ## Guardrails
 - Every country-level claim must trace to a specific `girai_*` / `oxford_*` row —
