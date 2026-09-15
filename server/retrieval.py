@@ -108,6 +108,8 @@ def query_dataset(
     columns: list[str] | None = None,
     filters: dict[str, Any] | None = None,
     limit: int = DEFAULT_LIMIT,
+    order_by: str | None = None,
+    descending: bool = False,
 ) -> dict[str, Any]:
     """Retrieve rows from one whitelisted dataset.
 
@@ -121,6 +123,10 @@ def query_dataset(
             as {column: [v1, v2, ...]}. Values are always bound as query
             parameters, never interpolated into SQL.
         limit: Max rows to return (default 100, capped at 1000).
+        order_by: Optional column to sort by (e.g. "date" to find the most
+            recent rows in a has_history=True dataset). Checked against the
+            dataset's live column list like any other column name.
+        descending: Sort order_by descending instead of ascending.
 
     Returns:
         {"dataset": name, "columns": [...], "rows": [{column: value, ...}, ...]}
@@ -128,6 +134,12 @@ def query_dataset(
     ds = get_dataset(dataset)
     available = _get_columns(ds)
     available_names = {c["name"] for c in available}
+
+    if order_by is not None and order_by not in available_names:
+        raise UnknownColumnError(
+            f"Unknown order_by column '{order_by}' for dataset '{dataset}'. "
+            f"Call describe_dataset('{dataset}') for the valid column list."
+        )
 
     if columns:
         unknown = [c for c in columns if c not in available_names]
@@ -170,6 +182,8 @@ def query_dataset(
     )
     if where_clauses:
         sql += " WHERE " + " AND ".join(where_clauses)
+    if order_by is not None:
+        sql += f" ORDER BY {_quote_ident(order_by)} {'DESC' if descending else 'ASC'}"
     sql += f" LIMIT {safe_limit}"
 
     result = db.run_query(sql, params)

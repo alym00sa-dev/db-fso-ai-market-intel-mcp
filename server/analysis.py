@@ -1,74 +1,27 @@
 """Fixed analysis tools: the value-add layer over plain retrieval.
 
 model_roi ranks frontier models by capability-per-dollar from
-model_benchmarks. perception_vs_performance reconciles
-arena_agent_leaderboard (user perception) with model_benchmarks (measured
-capability) to flag models the market rates differently than benchmarks do.
-
-arena_agent_leaderboard and model_benchmarks share no key: the same model
-shows up under different display names in each table (e.g. arena's "Claude
-Fable 5 (High)" vs benchmarks' "Claude Fable 5 (Adaptive Reasoning, Max
-Effort...)"). MODEL_NAME_OVERRIDES + normalize_model_name() below do that
-reconciliation explicitly rather than relying on an exact string match.
+model_benchmarks. cost_efficiency_frontier finds the Pareto-optimal models on
+capability vs cost.
 """
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from server import retrieval
+from server.stats import to_float as _to_float
 
-# Exact-match overrides for model name pairs normalize_model_name()'s
-# heuristic can't reconcile on its own (i.e. names that differ by more than
-# a parenthetical suffix). Populate this as real mismatches turn up when
-# running perception_vs_performance against live data. Keys and values
-# should both already be lowercased/whitespace-collapsed, matching what
-# normalize_model_name() produces before the override lookup.
-MODEL_NAME_OVERRIDES: dict[str, str] = {}
-
-
-def normalize_model_name(raw_name: str | None) -> str:
-    """Reduce a model's display name to a canonical key for joining across tables.
-
-    Lowercases, strips whitespace, drops any trailing parenthetical suffix
-    (reasoning effort, mode, thinking budget, etc. — the part that tends to
-    vary between arena and benchmark naming), then applies
-    MODEL_NAME_OVERRIDES for pairs the heuristic can't reconcile.
-    """
-    if not raw_name:
-        return ""
-    name = raw_name.strip().lower()
-    name = re.sub(r"\s*\([^)]*\)\s*$", "", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    return MODEL_NAME_OVERRIDES.get(name, name)
-
-
-def _to_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _add_percentiles(rows: list[dict[str, Any]], value_key: str, percentile_key: str) -> None:
-    """In place: add a 0-1 percentile rank for value_key, computed within `rows`."""
-    n = len(rows)
-    if n <= 1:
-        for row in rows:
-            row[percentile_key] = 0.5
-        return
-    ordered = sorted(range(n), key=lambda i: rows[i][value_key])
-    for rank, idx in enumerate(ordered):
-        rows[idx][percentile_key] = rank / (n - 1)
+__all__ = [
+    "model_roi",
+    "cost_efficiency_frontier",
+]
 
 
 def model_roi(
-    model_column: str = "model_name",
-    score_column: str = "composite_score",
-    price_column: str = "price_per_1m_tokens_blended",
+    model_column: str = "name",
+    score_column: str = "intelligence_index",
+    price_column: str = "price_blended_3to1",
     limit: int = 50,
 ) -> dict[str, Any]:
     """Rank frontier models by capability-per-dollar (score_column / price_column).
@@ -76,11 +29,11 @@ def model_roi(
     Reads model_benchmarks. Rows missing a score or price, or with a
     non-positive price, are skipped rather than distorting the ranking.
 
-    The default column names are a best guess — if model_benchmarks uses
-    different names in your warehouse, call
-    describe_dataset('model_benchmarks') and pass the correct ones via
-    model_column/score_column/price_column. A name that doesn't exist
-    raises a clear error rather than silently returning nothing.
+    Defaults match the current (premium AA) model_benchmarks schema. If your
+    warehouse uses different names, call describe_dataset('model_benchmarks')
+    and pass the correct ones via model_column/score_column/price_column. A
+    name that doesn't exist raises a clear error rather than silently
+    returning nothing.
     """
     data = retrieval.query_dataset(
         "model_benchmarks",
@@ -112,85 +65,57 @@ def model_roi(
     }
 
 
-def perception_vs_performance(
-    arena_model_column: str = "model_name",
-    arena_score_column: str = "score",
-    benchmark_model_column: str = "model_name",
-    benchmark_score_column: str = "composite_score",
+def cost_efficiency_frontier(
+    model_column: str = "name",
+    score_column: str = "intelligence_index",
+    cost_column: str = "cost_per_task_total",
     limit: int = 200,
-    overrated_threshold: float = 0.15,
 ) -> dict[str, Any]:
-    """Compare user perception (arena) against measured capability (benchmarks).
+    """Pareto frontier of capability (score_column) vs cost (cost_column).
 
-    Joins arena_agent_leaderboard to model_benchmarks by normalized model
-    name (see normalize_model_name) since the two tables share no key and
-    use different display-name conventions for the same model. For each
-    matched model, computes its percentile rank within the matched set on
-    both arena score and benchmark score, then flags models whose arena
-    percentile exceeds its benchmark percentile by more than
-    `overrated_threshold` as "overrated" (the market rates it above what
-    benchmarks support), and the reverse as "underrated".
+    Reads model_benchmarks. A model is "on the frontier" if no other model
+    is both cheaper-or-equal AND at least as capable — i.e. nothing strictly
+    dominates it. Deterministic: sort by cost ascending, keep every model
+    whose score is a new best-so-far (a classic skyline scan), everything
+    else is "dominated" (some cheaper-or-equal model already matches or
+    beats its capability). Sharper than model_roi's single ratio because it
+    doesn't force capability and cost onto one linear scale.
 
-    The default column names are a best guess for each table's schema — if
-    wrong, call describe_dataset('arena_agent_leaderboard') /
-    describe_dataset('model_benchmarks') and pass the correct names.
+    Rows missing a score or cost, or with non-positive cost, are skipped.
     """
-    arena = retrieval.query_dataset(
-        "arena_agent_leaderboard",
-        columns=[arena_model_column, arena_score_column],
-        limit=limit,
-    )
-    benchmarks = retrieval.query_dataset(
+    data = retrieval.query_dataset(
         "model_benchmarks",
-        columns=[benchmark_model_column, benchmark_score_column],
+        columns=[model_column, score_column, cost_column],
         limit=limit,
     )
 
-    benchmark_by_key: dict[str, dict[str, Any]] = {}
-    for row in benchmarks["rows"]:
-        key = normalize_model_name(row.get(benchmark_model_column))
-        score = _to_float(row.get(benchmark_score_column))
-        if not key or score is None:
+    candidates = []
+    for row in data["rows"]:
+        model = row.get(model_column)
+        score = _to_float(row.get(score_column))
+        cost = _to_float(row.get(cost_column))
+        if model is None or score is None or cost is None or cost <= 0:
             continue
-        benchmark_by_key[key] = {"model": row.get(benchmark_model_column), "score": score}
+        candidates.append({"model": model, "score": score, "cost": cost})
 
-    matched = []
-    unmatched_arena_models = []
-    for row in arena["rows"]:
-        key = normalize_model_name(row.get(arena_model_column))
-        arena_score = _to_float(row.get(arena_score_column))
-        if not key or arena_score is None:
-            continue
-        bench = benchmark_by_key.get(key)
-        if bench is None:
-            unmatched_arena_models.append(row.get(arena_model_column))
-            continue
-        matched.append(
-            {
-                "model_key": key,
-                "arena_model_name": row.get(arena_model_column),
-                "benchmark_model_name": bench["model"],
-                "arena_score": arena_score,
-                "benchmark_score": bench["score"],
-            }
-        )
+    # Ties on cost: prefer the higher score first, so a same-cost model with
+    # lower capability is correctly seen as dominated rather than sneaking
+    # onto the frontier ahead of its better-scoring, same-priced peer.
+    candidates.sort(key=lambda r: (r["cost"], -r["score"]))
 
-    _add_percentiles(matched, "arena_score", "arena_percentile")
-    _add_percentiles(matched, "benchmark_score", "benchmark_percentile")
-
-    for row in matched:
-        gap = row["arena_percentile"] - row["benchmark_percentile"]
-        row["perception_gap"] = gap
-        if gap > overrated_threshold:
-            row["flag"] = "overrated"
-        elif gap < -overrated_threshold:
-            row["flag"] = "underrated"
+    frontier: list[dict[str, Any]] = []
+    dominated: list[dict[str, Any]] = []
+    best_score_so_far = float("-inf")
+    for row in candidates:
+        if row["score"] > best_score_so_far:
+            frontier.append(row)
+            best_score_so_far = row["score"]
         else:
-            row["flag"] = "in_line"
-
-    matched.sort(key=lambda r: r["perception_gap"], reverse=True)
+            dominated.append(row)
 
     return {
-        "matched": matched,
-        "unmatched_arena_models": unmatched_arena_models,
+        "score_column": score_column,
+        "cost_column": cost_column,
+        "frontier": frontier,
+        "dominated": dominated,
     }

@@ -8,6 +8,11 @@ dependencies = [
     "databricks-sdk",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
 [project.scripts]
 custom-server = "server.main:main"
 
@@ -17,3 +22,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["server"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
