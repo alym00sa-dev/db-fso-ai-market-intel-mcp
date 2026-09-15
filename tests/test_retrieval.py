@@ -12,8 +12,8 @@ from server import db, retrieval
 from server.datasets import UnknownDatasetError
 
 
-def test_list_datasets_returns_all_19():
-    assert len(retrieval.list_datasets()) == 19
+def test_list_datasets_returns_all_16():
+    assert len(retrieval.list_datasets()) == 16
 
 
 def test_describe_dataset_unknown_raises(patch_get_columns):

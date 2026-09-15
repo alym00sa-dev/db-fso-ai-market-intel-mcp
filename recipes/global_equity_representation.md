@@ -51,7 +51,6 @@ guarantee, it needs a well-grounded story.
   not a guaranteed join (unlike `model_scorecard`'s reconciliation). Say "likely the
   same model as X" rather than asserting it silently if the match isn't clean, and
   don't drop unmatched models from the read without saying so.
-- Don't cite `hiring_*` tables here — they're stale (not refreshed since ~2026-07-28)
-  and out of scope for this recipe regardless.
+- Hiring data isn't in this server's whitelist and is out of scope for this recipe.
 - If a requested country/region has no rows in one of the four table families, say
   "no data" for that layer rather than omitting the country from the whole read.

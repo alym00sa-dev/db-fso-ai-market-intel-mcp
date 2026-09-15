@@ -1,8 +1,8 @@
 from server import datasets
 
 
-def test_whitelist_has_19_datasets():
-    assert len(datasets.DATASETS) == 19
+def test_whitelist_has_16_datasets():
+    assert len(datasets.DATASETS) == 16
 
 
 def test_new_tables_whitelisted():
@@ -24,9 +24,9 @@ def test_girai_scores_tables_overwritten_single_edition_not_history():
         assert datasets.get_dataset(name).has_history is False
 
 
-def test_hiring_tables_flagged_stale():
-    for name in ("hiring_jobs", "hiring_weekly", "hiring_weekly_breakdown"):
-        assert "stale" in datasets.get_dataset(name).description.lower()
+def test_hiring_tables_not_whitelisted():
+    for name in ("hiring_jobs", "hiring_weekly", "hiring_weekly_breakdown", "hiring_snapshots"):
+        assert name not in datasets.DATASETS
 
 
 def test_unknown_dataset_fails_closed():

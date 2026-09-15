@@ -5,11 +5,11 @@ from fastmcp import FastMCP
 from server import analysis, compute_fit, retrieval, scorecard
 
 INSTRUCTIONS = """\
-AI Market Intelligence over fso_market_intelligence.frontier_labs (19 datasets).
+AI Market Intelligence over fso_market_intelligence.frontier_labs (16 datasets).
 Three kinds of tools — use the cheapest one that answers the question:
 
 1. Query (list_datasets, describe_dataset, query_dataset) — conversational access
-   to any of the 19 datasets. Start here for "what does the data say about X".
+   to any of the 16 datasets. Start here for "what does the data say about X".
 2. Deterministic calculators (compute_fit, cost_efficiency_frontier, model_roi) —
    reproducible math. Same inputs always give the same answer.
 3. Analyses (model_scorecard) — cross-source triangulation with deterministic
@@ -19,8 +19,6 @@ Three kinds of tools — use the cheapest one that answers the question:
 Known caveats, always worth surfacing to the user:
 - model_benchmarks is OVERWRITTEN DAILY (has_history=False) — use release_date as
   the time axis for any "over time" question, not load date.
-- hiring_jobs / hiring_weekly / hiring_weekly_breakdown are STALE (not refreshed
-  since ~2026-07-28) — flag this if a user leans on hiring data.
 - openrouter_rankings: filter is_aggregate=false for single-model reads; the
   is_aggregate=true rows are author/family rollups.
 - ornn_gpu_prices / compute_fit only cover 5 GPUs (4 datacenter + 1 consumer RTX

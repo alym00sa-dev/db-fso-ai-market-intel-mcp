@@ -46,37 +46,6 @@ class Dataset:
 
 
 _DATASET_LIST = [
-    # Hiring / frontier labs — NOT REFRESHED since ~2026-07-28, treat as stale.
-    Dataset(
-        name="hiring_jobs",
-        table="hiring_jobs",
-        category="Hiring / frontier labs",
-        description=(
-            "One row per individual job posting at a frontier lab (title, category, "
-            "status). (NOT REFRESHED since ~2026-07-28 — treat as stale.)"
-        ),
-        has_history=False,
-    ),
-    Dataset(
-        name="hiring_weekly",
-        table="hiring_weekly",
-        category="Hiring / frontier labs",
-        description=(
-            "One row per company per week: open/new/removed job counts, incl. "
-            "social-impact roles. (NOT REFRESHED since ~2026-07-28 — treat as stale.)"
-        ),
-        has_history=True,
-    ),
-    Dataset(
-        name="hiring_weekly_breakdown",
-        table="hiring_weekly_breakdown",
-        category="Hiring / frontier labs",
-        description=(
-            "One row per company per week per category/sub_area/theme/vertical: job "
-            "counts at that grain. (NOT REFRESHED since ~2026-07-28 — treat as stale.)"
-        ),
-        has_history=True,
-    ),
     # Model capability & perception
     Dataset(
         name="model_benchmarks",
