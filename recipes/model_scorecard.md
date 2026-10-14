@@ -23,10 +23,16 @@ this recipe's job, done by an MCP client (Claude) reasoning over the card's fiel
    benchmark peer set doesn't, recency, marketing) rather than restating the number.
 5. **Cost + self-host:** report `cost.price_blended_3to1` / `cost.cost_per_task_total`
    plainly. For `cost.self_host`, if `self_hostable` is `false`, say self-hosting isn't
-   an option (closed-weight) — don't speculate a number. If a `cheapest_fit.note`
-   contains the commodity-hardware caveat, lead with that rather than a $/hr figure it
-   would be misleading to feature. If it's a multi-GPU plan, say so and flag the
-   interconnect-overhead caveat already present in `caveats`.
+   an option (closed-weight) — don't speculate a number. Otherwise read
+   `cheapest_fit`: if its `note` contains the commodity-hardware caveat, lead with that
+   rather than a $/hr figure it would be misleading to feature; if it's a multi-GPU plan
+   (`n_gpus`/`replicas`/`cost_usd_hr` present), say so and surface the interconnect
+   caveat from `caveats`. Mention the concurrency this buys (`max_concurrent_requests`
+   on the matching entry in `configurations`) rather than just a bare $/hr, and check
+   `assumptions.kv_source` — if it's `"estimated"`, caveat the self-host number as
+   rougher than when architecture is known. If `max_context_stress` is present and the
+   question is about long-context use, check whether a full-window request actually
+   fits before assuming the sized configuration holds up.
 6. **Close with the "so what."** One or two sentences translating the flags into a
    decision-relevant read for the foundation's work — e.g. "underadopted" + open-weight
    + cheap self-host cost → worth a pilot; "hyped" + high cost → wait for benchmarks to
