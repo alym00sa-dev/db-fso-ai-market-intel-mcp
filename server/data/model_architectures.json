@@ -1,5 +1,5 @@
 {
-  "llama-3.3-70b-instruct": {
+  "llama-3-3-instruct-70b": {
     "num_layers": 80,
     "num_kv_heads": 8,
     "head_dim": 128,

@@ -134,6 +134,24 @@ def test_open_weight_model_gets_compute_fit_delegated_self_host(wired_up):
     assert "cheapest_fit" in self_host  # came from compute_fit, not inlined math
 
 
+def test_self_host_uses_int8_not_full_precision(wired_up):
+    # A realistic self-host assumption, not fp16 — sizing every scorecard at
+    # full precision makes nearly every open-weight model look pricier/harder
+    # to host than a typical real deployment actually is.
+    card = scorecard.model_scorecard("Gamma Small 7B")
+    assert card["cost"]["self_host"]["precision"] == "int8"
+
+
+def test_self_host_embedding_is_trimmed_not_the_full_dump(wired_up):
+    # The full per-configuration breakdown (up to 20 entries) and context-stress
+    # block shouldn't bloat the scorecard — call compute_fit() directly for that.
+    card = scorecard.model_scorecard("Gamma Small 7B")
+    self_host = card["cost"]["self_host"]
+    assert "configurations" not in self_host
+    assert "max_context_stress" not in self_host
+    assert "cheapest_fit" in self_host and "fits_on" in self_host
+
+
 def test_model_not_found_fails_closed(wired_up):
     with pytest.raises(scorecard.ModelScorecardError):
         scorecard.model_scorecard("Totally Not A Model")

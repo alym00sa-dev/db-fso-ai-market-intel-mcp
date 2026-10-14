@@ -235,10 +235,14 @@ def _model_benchmarks_route(rows):
 
 
 LLAMA_BENCHMARK_COLUMNS = ["name", "slug", "params_total_b", "context_window_tokens", "is_open_weights"]
+# Real shape confirmed live against model_benchmarks (2026-10-14): name is
+# "Llama 3.3 Instruct 70B" (Instruct BEFORE 70B — opposite of what an earlier
+# version of this test file assumed) and slug is "llama-3-3-instruct-70b"
+# (dashes, not dots) — not "llama-3.3-70b-instruct" as originally guessed.
 LLAMA_ROW = {
-    "name": "Llama 3.3 70B Instruct",
-    "slug": "llama-3.3-70b-instruct",
-    "params_total_b": 70.6,
+    "name": "Llama 3.3 Instruct 70B",
+    "slug": "llama-3-3-instruct-70b",
+    "params_total_b": 70.0,
     "context_window_tokens": 131072,
     "is_open_weights": True,
 }
@@ -253,8 +257,23 @@ def test_t14_forgiving_name_match(stub_describe_dataset, stub_query_dataset):
             "model_benchmarks": _model_benchmarks_route([LLAMA_ROW]),
         },
     )
+    # The real-world failing query from live feedback: word order differs
+    # from the stored name ("Instruct 70B" vs. query's "70b"-then-nothing).
     result = cf.compute_fit(model="llama 3.3 70b")
-    assert result["model"] == "Llama 3.3 70B Instruct"
+    assert result["model"] == "Llama 3.3 Instruct 70B"
+
+
+def test_lookup_suggests_close_matches_on_total_miss(stub_describe_dataset, stub_query_dataset):
+    stub_describe_dataset(cf, {"model_benchmarks": LLAMA_BENCHMARK_COLUMNS})
+    stub_query_dataset(
+        cf,
+        {
+            "ornn_gpu_prices": GPU_PRICE_ROWS,
+            "model_benchmarks": _model_benchmarks_route([LLAMA_ROW]),
+        },
+    )
+    with pytest.raises(cf.ComputeFitError, match="Did you mean"):
+        cf.compute_fit(model="llama 3.3 70b instrukt")  # typo, but close
 
 
 # --- T15: ambiguous name ---
@@ -263,7 +282,7 @@ def test_t14_forgiving_name_match(stub_describe_dataset, stub_query_dataset):
 def test_t15_ambiguous_name_raises(stub_describe_dataset, stub_query_dataset):
     rows = [
         LLAMA_ROW,
-        {**LLAMA_ROW, "name": "Llama 3.3 70B Instruct Turbo", "slug": "llama-3.3-70b-instruct-turbo"},
+        {**LLAMA_ROW, "name": "Llama 3.3 Instruct 70B Turbo", "slug": "llama-3-3-instruct-70b-turbo"},
     ]
     stub_describe_dataset(cf, {"model_benchmarks": LLAMA_BENCHMARK_COLUMNS})
     stub_query_dataset(
@@ -286,7 +305,7 @@ def test_t16_model_lookup_defaults_context_to_8192(stub_describe_dataset, stub_q
             "model_benchmarks": _model_benchmarks_route([LLAMA_ROW]),
         },
     )
-    result = cf.compute_fit(model="Llama 3.3 70B Instruct")
+    result = cf.compute_fit(model="Llama 3.3 Instruct 70B")
     assert result["assumptions"]["context_length"] == 8192
     assert "max_context_stress" in result
     assert result["max_context_stress"]["full_context_window_tokens"] == 131072
@@ -369,3 +388,96 @@ def test_unknown_model_fails_closed(stub_describe_dataset, stub_query_dataset):
     )
     with pytest.raises(cf.ComputeFitError):
         cf.compute_fit(model="Nonexistent Model 9000")
+
+
+# --- Regression: the real model_architectures.json key resolves against the
+# real live slug (previously seeded under a guessed, wrong-format key, which
+# silently fell back to the rougher "estimated" sizing for every real lookup) ---
+
+
+def test_architecture_override_resolves_for_real_llama_slug(stub_describe_dataset, stub_query_dataset):
+    stub_describe_dataset(cf, {"model_benchmarks": LLAMA_BENCHMARK_COLUMNS})
+    stub_query_dataset(
+        cf,
+        {
+            "ornn_gpu_prices": GPU_PRICE_ROWS,
+            "model_benchmarks": _model_benchmarks_route([LLAMA_ROW]),
+        },
+    )
+    result = cf.compute_fit(model="Llama 3.3 Instruct 70B")
+    assert result["assumptions"]["kv_source"] == "local_override"
+    assert "kv_mb_per_token_range" not in result  # exact formula used, not the estimate
+
+
+# --- Regression: precision-native warning must be visible ON the recommendation,
+# not just in the generic caveats list (A100 isn't fp8-native) ---
+
+
+def test_precision_warning_on_recommendation_not_just_caveats():
+    # Price A100 far cheaper than everything else so it would win on cost alone.
+    prices = {
+        "dataset": "ornn_gpu_prices",
+        "columns": ["date", "gpu_name", "index_value_usd_hr"],
+        "rows": [
+            {"date": "2026-09-01", "gpu_name": "A100 SXM4", "index_value_usd_hr": 0.1},
+            {"date": "2026-09-01", "gpu_name": "H100 SXM", "index_value_usd_hr": 99.0},
+            {"date": "2026-09-01", "gpu_name": "H200", "index_value_usd_hr": 99.0},
+            {"date": "2026-09-01", "gpu_name": "B200", "index_value_usd_hr": 99.0},
+            {"date": "2026-09-01", "gpu_name": "RTX 5090", "index_value_usd_hr": 99.0},
+        ],
+    }
+    import unittest.mock as mock
+
+    with mock.patch.object(cf.retrieval, "query_dataset", return_value=prices):
+        result = cf.compute_fit(params_b=7, precision="fp8", batch_size=1)
+    assert result["cheapest_fit"].get("gpu_name") == "A100 SXM4"
+    assert "note" in result["cheapest_fit"]
+    assert "fp8" in result["cheapest_fit"]["note"]
+    assert "natively accelerated" in result["cheapest_fit"]["note"]
+
+
+def test_precision_native_field_on_every_configuration():
+    result = cf.compute_fit(params_b=7, precision="fp8")
+    a100_cfg = _config(result, "A100 SXM4", 1)
+    h100_cfg = _config(result, "H100 SXM", 1)
+    assert a100_cfg["precision_native"] is False
+    assert h100_cfg["precision_native"] is True
+
+
+# --- Regression: consumer GPUs (RTX 5090) are never sharded — no one links 8
+# gaming cards together, the interconnect doesn't support it ---
+
+
+def test_consumer_gpu_never_sharded():
+    result = cf.compute_fit(params_b=7, precision="fp16")
+    rtx_shards = {c["n_gpus_per_instance"] for c in result["configurations"] if c["gpu_name"] == "RTX 5090"}
+    assert rtx_shards == {1}
+
+
+# --- Regression: a config that needs replicas to hit batch_size is labeled
+# clearly as such, not as a vague "below target" that sounds like a failure ---
+
+
+def test_serves_with_replicas_status_not_literally_failing():
+    kwargs = {**LLAMA, "batch_size": 30}
+    result = cf.compute_fit(**kwargs, precision="fp8")
+    cfg = _config(result, "H100 SXM", 2)  # serves 25 alone; needs 2 replicas for 30
+    assert cfg["status"] == "serves_with_replicas"
+    assert cfg["replicas"] == 2
+    assert "serves_below_target" not in {c["status"] for c in result["configurations"]}
+
+
+def test_weights_share_note_absent_when_does_not_load():
+    result = cf.compute_fit(**LLAMA, precision="bf16")
+    cfg = _config(result, "H100 SXM", 2)  # does_not_load per T5
+    assert cfg["status"] == "does_not_load"
+    assert not any("little room" in n for n in cfg["notes"])
+
+
+# --- Regression: configurations are sorted (serving-first, then cost ascending) ---
+
+
+def test_configurations_sorted_serving_first_then_by_cost():
+    result = cf.compute_fit(**LLAMA, precision="fp8")
+    statuses = [cf._STATUS_PRIORITY[c["status"]] for c in result["configurations"]]
+    assert statuses == sorted(statuses)

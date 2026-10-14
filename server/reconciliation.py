@@ -39,8 +39,11 @@ def normalize_model_name(raw_name: str | None, *, is_permaslug: bool = False) ->
     Steps: lowercase; for permaslugs, drop the `vendor/` prefix; strip a trailing
     parenthetical suffix (reasoning effort, mode, thinking budget — the part that
     varies most between arena and benchmark naming); collapse `-`/`_`/`.` and
-    whitespace runs to single spaces; then apply MODEL_NAME_OVERRIDES for pairs
-    this heuristic can't reconcile on its own.
+    whitespace runs to single spaces; **sort the resulting words** — confirmed
+    against live data that the same model can appear in a different word order
+    per source (e.g. AA's "Llama 3.3 Instruct 70B" vs. a permaslug-derived
+    "llama 3.3 70b instruct"), which breaks plain ordered-string equality; then
+    apply MODEL_NAME_OVERRIDES for pairs this heuristic still can't reconcile.
     """
     if not raw_name:
         return ""
@@ -50,6 +53,7 @@ def normalize_model_name(raw_name: str | None, *, is_permaslug: bool = False) ->
     name = re.sub(r"\s*\([^)]*\)\s*$", "", name)
     name = re.sub(r"[-_.]+", " ", name)
     name = re.sub(r"\s+", " ", name).strip()
+    name = " ".join(sorted(name.split()))
     return MODEL_NAME_OVERRIDES.get(name, name)
 
 

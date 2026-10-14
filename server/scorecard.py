@@ -181,9 +181,23 @@ def _cost_and_selfhost(benchmark_row: dict[str, Any], resolved_name: str) -> dic
         }
         return cost
     try:
-        cost["self_host"] = compute_fit(model=resolved_name)
+        # int8 is a realistic default self-host assumption (a standard, widely
+        # supported quantization for serving), not full fp16 weights — sizing
+        # every scorecard's self-host read at fp16 would make nearly every
+        # open-weight model look pricier/harder to host than a typical real
+        # deployment actually is. Call compute_fit directly with precision=
+        # "fp16"/"fp8"/"int4" for other assumptions.
+        full = compute_fit(model=resolved_name, precision="int8")
     except ComputeFitError as exc:
         cost["self_host"] = {"self_hostable": None, "reason": str(exc)}
+        return cost
+    # Trim the bulky per-configuration breakdown (up to 20 entries) and the
+    # context-stress block before embedding — they make the scorecard huge for
+    # a field most readers won't drill into. Call compute_fit() directly for
+    # the full configuration-by-configuration detail.
+    cost["self_host"] = {
+        k: v for k, v in full.items() if k not in ("configurations", "max_context_stress")
+    }
     return cost
 
 

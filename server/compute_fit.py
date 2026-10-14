@@ -23,13 +23,14 @@ not extrapolate to multi-node (>8 GPU) deployments.
 
 from __future__ import annotations
 
+import difflib
 import json
 import math
-import re
 from pathlib import Path
 from typing import Any
 
 from server import retrieval
+from server.reconciliation import normalize_model_name
 from server.stats import to_float
 
 # Weight precision -> bytes/param. 4-bit formats carry per-group quantization
@@ -81,11 +82,32 @@ _CONSUMER_NOTE = (
 )
 _MULTI_NODE_NOTE = "requires multi-node; not evaluated"
 
-# Local architecture overrides, keyed by model_benchmarks.slug, for models
-# where num_layers/num_kv_heads/head_dim aren't (yet) columns on
-# model_benchmarks itself. Populate from each model's Hugging Face
-# config.json as they come up — do not invent values.
-# TODO: only llama-3.3-70b-instruct is seeded; every other model still falls
+# Lower = more worth a reader's attention. `configurations` is sorted by this
+# (then cost ascending) so a scan from the top sees the usable options first —
+# `does_not_load` configs sort last rather than being mixed in by GPU order.
+_STATUS_PRIORITY = {
+    "serves_workload": 0,
+    "serves_with_replicas": 1,
+    "loads_but_cannot_serve": 2,
+    "does_not_load": 3,
+}
+
+# fp8/fp4 aren't natively accelerated on every GPU — these are caveats, never
+# an exclusion (a config is still evaluated and can still be the cheapest
+# pick), but the mismatch must be visible ON that pick, not just buried in the
+# generic caveats list (see _precision_note / cheapest_fit construction).
+_NATIVE_PRECISION_GPUS = {
+    "fp8": {"H100 SXM", "H200", "B200", "RTX 5090"},
+    "fp4": {"B200", "RTX 5090"},
+}
+
+# Local architecture overrides, keyed by model_benchmarks.slug (matched via a
+# normalized/canonical comparison, not raw string equality — slug formatting
+# has been observed to drift, e.g. "llama-3.3-70b-instruct" vs the real
+# "llama-3-3-instruct-70b", which silently fell back to the rougher estimate
+# until this was caught against live data). Populate from each model's
+# Hugging Face config.json as they come up — do not invent values.
+# TODO: only llama-3-3-instruct-70b is seeded; every other model still falls
 # back to the GQA estimate until its real config.json values are added here.
 _ARCH_OVERRIDE_PATH = Path(__file__).parent / "data" / "model_architectures.json"
 
@@ -96,9 +118,10 @@ _ARCH_COLUMNS = ("num_layers", "num_kv_heads", "head_dim", "num_attention_heads"
 def _load_arch_overrides() -> dict[str, dict[str, Any]]:
     try:
         with open(_ARCH_OVERRIDE_PATH) as f:
-            return json.load(f)
+            raw = json.load(f)
     except FileNotFoundError:
         return {}
+    return {normalize_model_name(k): v for k, v in raw.items()}
 
 
 _ARCH_OVERRIDES = _load_arch_overrides()
@@ -112,23 +135,34 @@ def _normalize_gpu_key(name: str) -> str:
     return " ".join(name.strip().lower().split())
 
 
-def _normalize_name(name: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", name.lower())
-
-
 def _available_columns(dataset: str) -> set[str]:
     return {c["name"] for c in retrieval.describe_dataset(dataset)["columns"]}
+
+
+def _row_names(row: dict[str, Any]) -> list[str]:
+    return [row[c] for c in ("name", "slug") if row.get(c)]
+
+
+def _row_token_set(row: dict[str, Any]) -> set[str]:
+    tokens: set[str] = set()
+    for n in _row_names(row):
+        tokens |= set(normalize_model_name(n).split())
+    return tokens
 
 
 def _lookup_model_row(model: str) -> dict[str, Any]:
     """Resolve `model` to a model_benchmarks row.
 
     Tries exact equality on name, then slug (fast path, one round trip each).
-    Failing that, pulls all rows and matches on a normalized key (lowercase,
-    [a-z0-9] only): first a unique exact normalized match, then a unique row
-    whose normalized name/slug contains the normalized query. Zero or
-    multiple matches at the end raise ComputeFitError listing up to 5
-    candidates — never auto-picks among ambiguous matches.
+    Failing that, pulls all rows and matches via the shared
+    normalize_model_name() canonical key (lowercase, separators collapsed,
+    word order sorted — so "llama 3.3 70b" and "Llama 3.3 Instruct 70B" don't
+    need identical word order to match, confirmed against real AA naming):
+    first a unique exact canonical match, then a unique row whose canonical
+    *token set* is a superset of the query's (handles an abbreviated query
+    missing a word, e.g. "Instruct"). Zero or multiple matches raise
+    ComputeFitError — listing up to 5 ambiguous candidates, or the closest
+    few names by similarity when nothing matched at all. Never auto-picks.
     """
     available = _available_columns("model_benchmarks")
     columns = [c for c in _BASE_MODEL_COLUMNS if c in available] + [
@@ -147,16 +181,16 @@ def _lookup_model_row(model: str) -> dict[str, Any]:
     all_rows = retrieval.query_dataset("model_benchmarks", columns=columns, limit=retrieval.MAX_LIMIT)[
         "rows"
     ]
-    query_norm = _normalize_name(model)
+    query_canonical = normalize_model_name(model)
 
-    def normalized_fields(row: dict[str, Any]) -> list[str]:
-        return [_normalize_name(row[c]) for c in ("name", "slug") if row.get(c)]
-
-    exact = [r for r in all_rows if query_norm in normalized_fields(r)]
+    exact = [r for r in all_rows if any(normalize_model_name(n) == query_canonical for n in _row_names(r))]
     if len(exact) == 1:
         return exact[0]
 
-    contains = [r for r in all_rows if any(query_norm in nf for nf in normalized_fields(r))]
+    query_tokens = set(query_canonical.split())
+    contains = (
+        [r for r in all_rows if query_tokens.issubset(_row_token_set(r))] if query_tokens else []
+    )
     if len(contains) == 1:
         return contains[0]
 
@@ -167,9 +201,15 @@ def _lookup_model_row(model: str) -> dict[str, Any]:
             f"Ambiguous model '{model}' — matches: {candidates} (showing up to 5). "
             "Pass the exact name or slug."
         )
+
+    all_names = [n for r in all_rows for n in _row_names(r)]
+    suggestions = difflib.get_close_matches(model, all_names, n=5, cutoff=0.5)
+    if suggestions:
+        raise ComputeFitError(f"Model '{model}' not found in model_benchmarks. Did you mean: {suggestions}?")
     raise ComputeFitError(
-        f"Model '{model}' not found in model_benchmarks by name, slug, or normalized "
-        "match. Call query_dataset('model_benchmarks', ...) to find the right identifier."
+        f"Model '{model}' not found in model_benchmarks by name, slug, or token match, and "
+        "no close matches were found. Call query_dataset('model_benchmarks', ...) to find "
+        "the right identifier."
     )
 
 
@@ -245,7 +285,7 @@ def _resolve_architecture(
             )
 
         slug = model_row.get("slug")
-        override = _ARCH_OVERRIDES.get(slug) if slug else None
+        override = _ARCH_OVERRIDES.get(normalize_model_name(slug)) if slug else None
         if override:
             return (
                 {
@@ -272,6 +312,29 @@ def _kv_sizing(
     gqa_mb = _KV_GQA_COEFFICIENT * (params_b**_KV_GQA_EXPONENT) * scale
     mha_mb = _KV_MHA_COEFFICIENT * (params_b**_KV_MHA_EXPONENT) * scale
     return gqa_mb * 1e6, [round(gqa_mb, 4), round(mha_mb, 4)]
+
+
+def _shard_sizes_for(spec: dict[str, Any]) -> tuple[int, ...]:
+    """Consumer cards (e.g. RTX 5090) lack the fast interconnect (NVLink)
+    datacenter cards have, so sharding a model across several of them isn't a
+    realistic deployment — only evaluate n=1 for the consumer class."""
+    if spec["class"] == "consumer":
+        return (1,)
+    return _SHARD_SIZES
+
+
+def _precision_note(precision: str, gpu_name: str) -> str | None:
+    """None if `precision` is native on `gpu_name` (or isn't one we track
+    native-support nuances for); otherwise the caveat text — attached directly
+    to the configuration (and propagated into cheapest_fit), not left to the
+    generic top-level caveats list where it's easy to miss on the actual pick."""
+    native_gpus = _NATIVE_PRECISION_GPUS.get(precision)
+    if native_gpus is None or gpu_name in native_gpus:
+        return None
+    return (
+        f"{precision} isn't natively accelerated on {gpu_name} — weight-only kernels may "
+        "still run it, but throughput/efficiency may suffer."
+    )
 
 
 def compute_fit(
@@ -383,7 +446,7 @@ def compute_fit(
         price_per_gpu = price_info["price_usd_hr"] if price_info else None
         price_as_of = price_info["date"] if price_info else None
 
-        for n in _SHARD_SIZES:
+        for n in _shard_sizes_for(spec):
             if resolved_num_attention_heads is not None and resolved_num_attention_heads % n != 0:
                 continue
 
@@ -398,7 +461,11 @@ def compute_fit(
             elif max_concurrent == 0:
                 status = "loads_but_cannot_serve"
             elif max_concurrent < batch_size:
-                status = "serves_below_target"
+                # NOT a failure — replicas (below) cover the gap. This status
+                # means "needs horizontal scaling to hit batch_size", not
+                # "broken"; a config here that becomes cheapest_fit still gets
+                # a correctly-sized replicas/total_gpus/cost_usd_hr.
+                status = "serves_with_replicas"
             else:
                 status = "serves_workload"
 
@@ -415,10 +482,16 @@ def compute_fit(
             weights_share = weights_gb / usable_gb if usable_gb > 0 else None
 
             notes: list[str] = []
-            if weights_share is not None and weights_share > 0.67:
+            # Gated on status != does_not_load: a config that can't even load
+            # weights shouldn't also claim "little room for concurrency" —
+            # that note only makes sense once weights actually fit.
+            if weights_share is not None and weights_share > 0.67 and status != "does_not_load":
                 notes.append(
                     "weights exceed ~2/3 of usable memory; little room for KV cache / concurrency."
                 )
+            precision_note = _precision_note(precision, gpu_name)
+            if precision_note:
+                notes.append(precision_note)
 
             configurations.append(
                 {
@@ -428,6 +501,7 @@ def compute_fit(
                     "replicas": replicas,
                     "total_gpus": total_gpus,
                     "status": status,
+                    "precision_native": precision_note is None,
                     "usable_gb": round(usable_gb, 2),
                     "kv_pool_gb": round(kv_pool_gb, 2),
                     "token_budget": token_budget,
@@ -459,6 +533,18 @@ def compute_fit(
                 "replicas over sharding for throughput and fault isolation."
             )
 
+    # Sort the full list (nothing dropped — a does_not_load config is still
+    # meaningful information, see T5) so a reader scanning top-to-bottom hits
+    # the usable options first and sees cost-ascending order within each.
+    configurations.sort(
+        key=lambda c: (
+            _STATUS_PRIORITY[c["status"]],
+            c["cost_usd_hr"] is None,
+            c["cost_usd_hr"] or 0.0,
+            c["n_gpus_per_instance"],
+        )
+    )
+
     serving_configs = [c for c in configurations if c["max_concurrent_requests"] >= 1]
     serving_configs.sort(
         key=lambda c: (c["cost_usd_hr"] is None, c["cost_usd_hr"] or 0.0, c["n_gpus_per_instance"])
@@ -479,22 +565,37 @@ def compute_fit(
 
     if serving_configs:
         top = serving_configs[0]
+        top_precision_note = _precision_note(precision, top["gpu_name"])
         if top["n_gpus_per_instance"] == 1 and top["replicas"] == 1:
             matching = next(f for f in fits_on if f["gpu_name"] == top["gpu_name"])
             if matching["class"] == "consumer":
                 cheapest_fit: dict[str, Any] = {"note": _CONSUMER_NOTE, "matching_gpu": matching}
             else:
-                cheapest_fit = matching
+                cheapest_fit = dict(matching)
+                cheapest_fit["note"] = None
+            if top_precision_note:
+                # Merge into the same field a reader sees first, rather than a
+                # separate key easy to skip past on the recommendation itself.
+                cheapest_fit["note"] = (
+                    f"{cheapest_fit['note']} — {top_precision_note}"
+                    if cheapest_fit.get("note")
+                    else top_precision_note
+                )
+            if cheapest_fit.get("note") is None:
+                del cheapest_fit["note"]
         else:
+            note = (
+                f"needs {top['n_gpus_per_instance']}x {top['gpu_name']} per instance, "
+                f"{top['replicas']} replica(s) for batch_size={batch_size}"
+            )
+            if top_precision_note:
+                note = f"{note} — {top_precision_note}"
             cheapest_fit = {
                 "n_gpus": top["n_gpus_per_instance"],
                 "gpu_name": top["gpu_name"],
                 "replicas": top["replicas"],
                 "cost_usd_hr": top["cost_usd_hr"],
-                "note": (
-                    f"needs {top['n_gpus_per_instance']}x {top['gpu_name']} per instance, "
-                    f"{top['replicas']} replica(s) for batch_size={batch_size}"
-                ),
+                "note": note,
             }
     else:
         cheapest_fit = {"note": _MULTI_NODE_NOTE}
