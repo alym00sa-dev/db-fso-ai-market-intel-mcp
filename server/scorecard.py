@@ -18,7 +18,7 @@ from typing import Any
 
 from server import retrieval
 from server.compute_fit import ComputeFitError, compute_fit
-from server.reconciliation import index_by_key, normalize_model_name
+from server.reconciliation import best_token_match
 from server.stats import add_percentiles, to_float
 
 _PEER_LIMIT = 500
@@ -52,8 +52,15 @@ def _available_columns(dataset: str) -> set[str]:
     return {c["name"] for c in retrieval.describe_dataset(dataset)["columns"]}
 
 
-def _measured_signal(model: str) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
-    """Returns (matched benchmark row, full peer row set, canonical model key)."""
+def _measured_signal(model: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Returns (matched benchmark row, full peer row set).
+
+    Matches via the shared token-subset matcher (see
+    reconciliation.best_token_match) rather than exact-string equality, so an
+    abbreviated query ("llama 3.3 70b") still resolves against a fuller real
+    name ("Llama 3.3 Instruct 70B") — the same fix compute_fit's model lookup
+    needed, reused here rather than re-implemented.
+    """
     available = _available_columns("model_benchmarks")
     identity_cols = [c for c in _IDENTITY_CANDIDATES if c in available]
     eval_cols = [c for c in _KEY_EVAL_CANDIDATES if c in available]
@@ -62,23 +69,19 @@ def _measured_signal(model: str) -> tuple[dict[str, Any], list[dict[str, Any]], 
 
     peers = retrieval.query_dataset("model_benchmarks", columns=columns, limit=_PEER_LIMIT)["rows"]
     name_col = "name" if "name" in available else identity_cols[0]
-    by_key = index_by_key(peers, name_col)
 
-    key = normalize_model_name(model)
-    row = by_key.get(key)
-    if row is None and "slug" in available:
-        by_slug_key = index_by_key(peers, "slug")
-        row = by_slug_key.get(key)
-    if row is None:
+    candidates = [(r.get(name_col) or r.get("slug"), r) for r in peers if r.get(name_col) or r.get("slug")]
+    match = best_token_match(model, candidates)
+    if match is None:
         raise ModelScorecardError(
-            f"'{model}' not found in model_benchmarks (checked name and slug, "
-            f"normalized). Call query_dataset('model_benchmarks', ...) to find the "
-            "right identifier."
+            f"'{model}' not found in model_benchmarks (token match against name/slug). "
+            "Call query_dataset('model_benchmarks', ...) to find the right identifier."
         )
-    return row, peers, key
+    row, _matched_name, _others = match
+    return row, peers
 
 
-def _stated_signal(model_key: str) -> dict[str, Any]:
+def _stated_signal(resolved_name: str) -> dict[str, Any]:
     # NOTE: arena_agent_leaderboard's model column is "model", not "model_name" —
     # load_arena_agent.ipynb renames the raw HF dataset's model_name -> model on
     # load. Confirmed against both that notebook and genie_context.md.
@@ -94,19 +97,19 @@ def _stated_signal(model_key: str) -> dict[str, Any]:
         r["score"] = to_float(r["score"])
     add_percentiles(scored, "score", "percentile")
 
-    by_key = index_by_key(scored, "model")
-    row = by_key.get(model_key)
-    if row is None:
-        return {"available": False, "reason": "not on arena"}
+    match = best_token_match(resolved_name, [(r["model"], r) for r in scored])
+    if match is None:
+        return {"available": False, "reason": f"not on arena (searched for '{resolved_name}')"}
+    row, matched_name, _others = match
     return {
         "available": True,
-        "arena_model_name": row["model"],
+        "arena_model_name": matched_name,
         "score": row["score"],
         "percentile": row["percentile"],
     }
 
 
-def _revealed_signal(model_key: str) -> dict[str, Any]:
+def _revealed_signal(resolved_name: str) -> dict[str, Any]:
     available = _available_columns("openrouter_rankings")
     required = {"date", "model_permaslug", "total_tokens", "is_aggregate", "rank"}
     if not required.issubset(available):
@@ -121,7 +124,7 @@ def _revealed_signal(model_key: str) -> dict[str, Any]:
         limit=1,
     )["rows"]
     if not latest:
-        return {"available": False, "reason": "not tracked on OpenRouter"}
+        return {"available": False, "reason": f"not tracked on OpenRouter (searched for '{resolved_name}')"}
     latest_date = latest[0]["date"]
 
     day_rows = retrieval.query_dataset(
@@ -131,10 +134,15 @@ def _revealed_signal(model_key: str) -> dict[str, Any]:
         order_by="rank",
         limit=retrieval.MAX_LIMIT,
     )["rows"]
-    by_key = index_by_key(day_rows, "model_permaslug", is_permaslug=True)
-    row = by_key.get(model_key)
-    if row is None:
-        return {"available": False, "reason": "not tracked on OpenRouter"}
+    # Strip the vendor/ prefix before matching (e.g. "meta-llama/llama-3.3-
+    # 70b-instruct" -> match on "llama-3.3-70b-instruct") — see
+    # reconciliation.best_token_match's is_permaslug handling.
+    match = best_token_match(
+        resolved_name, [(r["model_permaslug"], r) for r in day_rows], is_permaslug=True
+    )
+    if match is None:
+        return {"available": False, "reason": f"not tracked on OpenRouter (searched for '{resolved_name}')"}
+    row, matched_permaslug, _others = match
 
     total_ranked = len(day_rows)
     percentile = 1.0 - ((row["rank"] - 1) / (total_ranked - 1)) if total_ranked > 1 else 0.5
@@ -218,15 +226,17 @@ def model_scorecard(model: str) -> dict[str, Any]:
     from percentile gaps between signals, and only computed for signal pairs
     that are both available.
     """
-    benchmark_row, peers, model_key = _measured_signal(model)
+    benchmark_row, peers = _measured_signal(model)
     resolved_name = benchmark_row.get("name") or benchmark_row.get("slug") or model
 
     scored_peers = [p for p in peers if to_float(p.get("intelligence_index")) is not None]
     for p in scored_peers:
         p["intelligence_index"] = to_float(p["intelligence_index"])
     add_percentiles(scored_peers, "intelligence_index", "percentile")
+    # benchmark_row is one of the peer row objects (same reference, from the
+    # same query) — match by identity rather than re-normalizing a name.
     measured_percentile = next(
-        (p["percentile"] for p in scored_peers if normalize_model_name(p.get("name")) == model_key),
+        (p["percentile"] for p in scored_peers if p is benchmark_row),
         None,
     )
 
@@ -234,8 +244,8 @@ def model_scorecard(model: str) -> dict[str, Any]:
         col: to_float(benchmark_row[col]) for col in _KEY_EVAL_CANDIDATES if col in benchmark_row
     }
 
-    stated = _stated_signal(model_key)
-    revealed = _revealed_signal(model_key)
+    stated = _stated_signal(resolved_name)
+    revealed = _revealed_signal(resolved_name)
     cost = _cost_and_selfhost(benchmark_row, resolved_name)
 
     flags: list[str] = []

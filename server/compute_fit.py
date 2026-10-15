@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from server import retrieval
-from server.reconciliation import normalize_model_name
+from server.reconciliation import normalize_model_name, tokenize_model_name
 from server.stats import to_float
 
 # Weight precision -> bytes/param. 4-bit formats carry per-group quantization
@@ -91,6 +91,7 @@ _STATUS_PRIORITY = {
     "loads_but_cannot_serve": 2,
     "does_not_load": 3,
 }
+_WORKING_STATUSES = {"serves_workload", "serves_with_replicas"}
 
 # fp8/fp4 aren't natively accelerated on every GPU — these are caveats, never
 # an exclusion (a config is still evaluated and can still be the cheapest
@@ -111,8 +112,19 @@ _NATIVE_PRECISION_GPUS = {
 # back to the GQA estimate until its real config.json values are added here.
 _ARCH_OVERRIDE_PATH = Path(__file__).parent / "data" / "model_architectures.json"
 
-_BASE_MODEL_COLUMNS = ("name", "slug", "params_total_b", "context_window_tokens", "is_open_weights")
+_BASE_MODEL_COLUMNS = (
+    "name",
+    "slug",
+    "params_total_b",
+    "params_active_b",
+    "context_window_tokens",
+    "is_open_weights",
+)
 _ARCH_COLUMNS = ("num_layers", "num_kv_heads", "head_dim", "num_attention_heads")
+# Rows tied on name-match quality that share all three of these are the same
+# weights under a different mode (reasoning/non-reasoning, effort level, etc.)
+# — safe to auto-pick between them rather than forcing the caller to disambiguate.
+_VARIANT_TIE_COLUMNS = ("params_total_b", "params_active_b", "context_window_tokens")
 
 
 def _load_arch_overrides() -> dict[str, dict[str, Any]]:
@@ -143,31 +155,37 @@ def _row_names(row: dict[str, Any]) -> list[str]:
     return [row[c] for c in ("name", "slug") if row.get(c)]
 
 
-def _row_token_set(row: dict[str, Any]) -> set[str]:
-    tokens: set[str] = set()
-    for n in _row_names(row):
-        tokens |= set(normalize_model_name(n).split())
-    return tokens
-
-
-def _lookup_model_row(model: str) -> dict[str, Any]:
+def _lookup_model_row(model: str) -> tuple[dict[str, Any], str | None, list[str] | None]:
     """Resolve `model` to a model_benchmarks row.
 
+    Returns (row, matched_from, other_candidates). The latter two are None
+    when resolved via exact name/slug equality; populated when resolved via
+    fuzzy token-subset matching, so the caller can report what was actually
+    matched (and what else was close).
+
     Tries exact equality on name, then slug (fast path, one round trip each).
-    Failing that, pulls all rows and matches via the shared
-    normalize_model_name() canonical key (lowercase, separators collapsed,
-    word order sorted — so "llama 3.3 70b" and "Llama 3.3 Instruct 70B" don't
-    need identical word order to match, confirmed against real AA naming):
-    first a unique exact canonical match, then a unique row whose canonical
-    *token set* is a superset of the query's (handles an abbreviated query
-    missing a word, e.g. "Instruct"). Zero or multiple matches raise
-    ComputeFitError — listing up to 5 ambiguous candidates, or the closest
-    few names by similarity when nothing matched at all. Never auto-picks.
+    Failing that, pulls all rows and tokenizes both the query and every row's
+    name/slug (see reconciliation.tokenize_model_name — lowercase, decimal
+    versions like "3.3" kept as one token, a hyphen-written version like
+    "3-3" merged back into "3.3"). A row matches if every query token appears
+    among its tokens; matches are ranked by fewest *extra* tokens (closest
+    match), ties broken by name.
+
+    - Exactly one match at the best rank -> auto-picked.
+    - Several tied at the best rank but sharing identical
+      params_total_b/params_active_b/context_window_tokens (reasoning vs.
+      non-reasoning, effort-level variants of the same weights) -> auto-picked
+      (the first, after the name tie-break).
+    - Otherwise -> ComputeFitError listing up to 5 candidates, best match
+      first. Never silently picks among genuinely different models — this is
+      the fix for a real bug where "llama 3.3 70b" surfaced only Llama 3.1
+      rows (token-level "3.3"/"3.1" collision in an earlier, naive matcher).
     """
     available = _available_columns("model_benchmarks")
-    columns = [c for c in _BASE_MODEL_COLUMNS if c in available] + [
-        c for c in _ARCH_COLUMNS if c in available
-    ]
+    columns = (
+        [c for c in _BASE_MODEL_COLUMNS if c in available]
+        + [c for c in _ARCH_COLUMNS if c in available]
+    )
 
     for column in ("name", "slug"):
         if column not in available:
@@ -176,41 +194,50 @@ def _lookup_model_row(model: str) -> dict[str, Any]:
             "model_benchmarks", columns=columns, filters={column: model}, limit=1
         )
         if result["rows"]:
-            return result["rows"][0]
+            return result["rows"][0], None, None
 
     all_rows = retrieval.query_dataset("model_benchmarks", columns=columns, limit=retrieval.MAX_LIMIT)[
         "rows"
     ]
-    query_canonical = normalize_model_name(model)
+    query_tokens = set(tokenize_model_name(model))
 
-    exact = [r for r in all_rows if any(normalize_model_name(n) == query_canonical for n in _row_names(r))]
-    if len(exact) == 1:
-        return exact[0]
+    scored: list[tuple[int, str, dict[str, Any]]] = []
+    if query_tokens:
+        for row in all_rows:
+            name = row.get("name") or row.get("slug") or ""
+            row_tokens = set(tokenize_model_name(name))
+            if query_tokens.issubset(row_tokens):
+                scored.append((len(row_tokens - query_tokens), name, row))
 
-    query_tokens = set(query_canonical.split())
-    contains = (
-        [r for r in all_rows if query_tokens.issubset(_row_token_set(r))] if query_tokens else []
-    )
-    if len(contains) == 1:
-        return contains[0]
-
-    pool = exact if len(exact) > 1 else contains
-    if pool:
-        candidates = [r.get("name") or r.get("slug") for r in pool[:5]]
+    if not scored:
+        all_names = [n for r in all_rows for n in _row_names(r)]
+        suggestions = difflib.get_close_matches(model, all_names, n=5, cutoff=0.5)
+        if suggestions:
+            raise ComputeFitError(
+                f"Model '{model}' not found in model_benchmarks. Did you mean: {suggestions}?"
+            )
         raise ComputeFitError(
-            f"Ambiguous model '{model}' — matches: {candidates} (showing up to 5). "
-            "Pass the exact name or slug."
+            f"Model '{model}' not found in model_benchmarks by name, slug, or token match, "
+            "and no close matches were found. Call query_dataset('model_benchmarks', ...) to "
+            "find the right identifier."
         )
 
-    all_names = [n for r in all_rows for n in _row_names(r)]
-    suggestions = difflib.get_close_matches(model, all_names, n=5, cutoff=0.5)
-    if suggestions:
-        raise ComputeFitError(f"Model '{model}' not found in model_benchmarks. Did you mean: {suggestions}?")
-    raise ComputeFitError(
-        f"Model '{model}' not found in model_benchmarks by name, slug, or token match, and "
-        "no close matches were found. Call query_dataset('model_benchmarks', ...) to find "
-        "the right identifier."
-    )
+    scored.sort(key=lambda t: (t[0], t[1]))
+    best_extra = scored[0][0]
+    tied = [t for t in scored if t[0] == best_extra]
+
+    if len(tied) > 1:
+        variant_keys = {tuple(t[2].get(c) for c in _VARIANT_TIE_COLUMNS) for t in tied}
+        if len(variant_keys) > 1:
+            candidates = [t[1] for t in scored[:5]]
+            raise ComputeFitError(
+                f"Ambiguous model '{model}' — matches: {candidates} (showing up to 5, best "
+                "match first). Pass the exact name or slug."
+            )
+
+    chosen = tied[0]
+    other_candidates = [t[1] for t in scored if t is not chosen][:4]
+    return chosen[2], model, other_candidates
 
 
 def _lookup_price(prices: dict[str, dict[str, Any]], gpu_name: str) -> dict[str, Any] | None:
@@ -337,6 +364,18 @@ def _precision_note(precision: str, gpu_name: str) -> str | None:
     )
 
 
+def _ruled_out_reason(cfg: dict[str, Any], precision: str) -> str:
+    """One short phrase for why a configuration isn't in the trimmed
+    `configurations` list (see include_all_configurations=False)."""
+    if cfg["status"] == "does_not_load":
+        return "weights don't fit"
+    if cfg["status"] == "loads_but_cannot_serve":
+        return "loads but no room for conversations"
+    if not cfg["precision_native"]:
+        return f"{precision} not native (cheaper option shown separately)"
+    return "cost or capacity below the top options shown"
+
+
 def compute_fit(
     model: str | None = None,
     params_b: float | None = None,
@@ -351,16 +390,35 @@ def compute_fit(
     head_dim: int | None = None,
     num_attention_heads: int | None = None,
     overhead_factor: float | None = None,
+    include_all_configurations: bool = False,
 ) -> dict[str, Any]:
-    """Compute VRAM + concurrency fit for a model across Ornn's tracked GPUs.
+    """Compute VRAM + concurrency fit for a model across Ornn's tracked GPUs,
+    and recommend the cheapest configuration that natively supports the
+    requested precision.
 
     Pass either `model` (looked up in model_benchmarks by name/slug, with a
-    forgiving normalized-name fallback — see _lookup_model_row) or `params_b`
+    forgiving token-based fallback — see _lookup_model_row; when the match
+    wasn't an exact name/slug hit, the output includes `matched_from` and
+    `other_candidates` so the caller can say what was matched) or `params_b`
     directly. `context_length` always defaults to 8192 regardless of the
     model's actual context window (a self-host read sized to a 128K window by
     default would badly overstate typical request cost) — pass it explicitly
     to size for a different request length, or see `max_context_stress` for
     what a single full-context-window request would need.
+
+    `cheapest_fit` is the cheapest configuration that both serves the
+    requested `batch_size` (or the closest it can, via replicas) AND natively
+    supports `precision` — a GPU that technically works via weight-only
+    kernels but doesn't natively accelerate the chosen precision is never the
+    headline unless nothing native works at all. If a cheaper non-native
+    configuration exists, it's surfaced separately as
+    `cheaper_non_native_option` (with `savings_usd_hr`) rather than silently
+    omitted or presented as the default.
+
+    By default (`include_all_configurations=False`), `configurations` holds
+    only the top 5 working configurations (see `ruled_out` for a compact
+    summary of what else was evaluated and why it isn't shown); pass
+    `include_all_configurations=True` for the full evaluated set.
 
     `precision` sizes the weights; `kv_precision` sizes the KV cache
     independently (KV usually stays 16-bit even when weights are quantized).
@@ -398,13 +456,24 @@ def compute_fit(
     resolved_model_name: str | None = None
     model_row: dict[str, Any] | None = None
     model_context_window: float | None = None
+    matched_from: str | None = None
+    other_candidates: list[str] | None = None
+    params_source: str | None = "user_supplied" if params_b is not None else None
 
     if model is not None:
-        model_row = _lookup_model_row(model)
+        model_row, matched_from, other_candidates = _lookup_model_row(model)
         resolved_model_name = model_row.get("name") or model_row.get("slug")
         is_open_weights = model_row.get("is_open_weights")
         if params_b is None:
-            params_b = to_float(model_row.get("params_total_b"))
+            slug = model_row.get("slug")
+            override = _ARCH_OVERRIDES.get(normalize_model_name(slug)) if slug else None
+            override_params_b = to_float(override.get("params_total_b")) if override else None
+            if override_params_b is not None:
+                params_b = override_params_b
+                params_source = "local_override"
+            else:
+                params_b = to_float(model_row.get("params_total_b"))
+                params_source = "model_benchmarks"
             if params_b is None:
                 raise ComputeFitError(
                     f"model_benchmarks has no params_total_b for '{resolved_model_name}'. "
@@ -416,11 +485,15 @@ def compute_fit(
         raise ComputeFitError("params_b must be > 0.")
 
     if is_open_weights is False:
-        return {
+        closed_result: dict[str, Any] = {
             "model": resolved_model_name or model,
             "self_hostable": False,
             "reason": "Model is closed-weight (API-only) — self-host isn't an option.",
         }
+        if matched_from is not None:
+            closed_result["matched_from"] = matched_from
+            closed_result["other_candidates"] = other_candidates
+        return closed_result
 
     user_supplied_context = context_length is not None
     context_length = context_length or _DEFAULT_CONTEXT_LENGTH
@@ -533,22 +606,23 @@ def compute_fit(
                 "replicas over sharding for throughput and fault isolation."
             )
 
-    # Sort the full list (nothing dropped — a does_not_load config is still
-    # meaningful information, see T5) so a reader scanning top-to-bottom hits
-    # the usable options first and sees cost-ascending order within each.
-    configurations.sort(
-        key=lambda c: (
-            _STATUS_PRIORITY[c["status"]],
+    # Unified sort: works before doesn't, native-precision before not, then
+    # cost ascending, then total capacity descending (at equal cost, the setup
+    # that serves more concurrent users wins), then fewer GPUs per instance.
+    # Native preference lives IN this key (not a separate post-hoc rule) so
+    # configurations[0] and cheapest_fit can never disagree, by construction.
+    def _sort_key(c: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            c["status"] not in _WORKING_STATUSES,
+            not c["precision_native"],
             c["cost_usd_hr"] is None,
             c["cost_usd_hr"] or 0.0,
+            -(c["max_concurrent_requests"] * (c["replicas"] or 1)),
             c["n_gpus_per_instance"],
         )
-    )
 
-    serving_configs = [c for c in configurations if c["max_concurrent_requests"] >= 1]
-    serving_configs.sort(
-        key=lambda c: (c["cost_usd_hr"] is None, c["cost_usd_hr"] or 0.0, c["n_gpus_per_instance"])
-    )
+    configurations.sort(key=_sort_key)
+    working_configs = [c for c in configurations if c["status"] in _WORKING_STATUSES]
 
     fits_on = [
         {
@@ -563,8 +637,10 @@ def compute_fit(
     ]
     fits_on.sort(key=lambda g: (g["price_usd_hr"] is None, g["price_usd_hr"] or 0.0))
 
-    if serving_configs:
-        top = serving_configs[0]
+    cheaper_non_native_option: dict[str, Any] | None = None
+
+    if working_configs:
+        top = working_configs[0]  # already native-preferring by _sort_key
         top_precision_note = _precision_note(precision, top["gpu_name"])
         if top["n_gpus_per_instance"] == 1 and top["replicas"] == 1:
             matching = next(f for f in fits_on if f["gpu_name"] == top["gpu_name"])
@@ -574,8 +650,9 @@ def compute_fit(
                 cheapest_fit = dict(matching)
                 cheapest_fit["note"] = None
             if top_precision_note:
-                # Merge into the same field a reader sees first, rather than a
-                # separate key easy to skip past on the recommendation itself.
+                # Only reached when NO native option works at all (otherwise
+                # _sort_key already put a native config first) — merge into
+                # the same field a reader sees first either way.
                 cheapest_fit["note"] = (
                     f"{cheapest_fit['note']} — {top_precision_note}"
                     if cheapest_fit.get("note")
@@ -596,6 +673,38 @@ def compute_fit(
                 "replicas": top["replicas"],
                 "cost_usd_hr": top["cost_usd_hr"],
                 "note": note,
+            }
+
+        # Cheapest working config by cost alone (ignoring native preference) —
+        # if that's non-native and actually cheaper than the native-preferring
+        # cheapest_fit, surface it separately rather than hide a real option.
+        cheapest_overall = min(
+            working_configs,
+            key=lambda c: (
+                c["cost_usd_hr"] is None,
+                c["cost_usd_hr"] or 0.0,
+                -(c["max_concurrent_requests"] * (c["replicas"] or 1)),
+                c["n_gpus_per_instance"],
+            ),
+        )
+        if (
+            not cheapest_overall["precision_native"]
+            and cheapest_overall["cost_usd_hr"] is not None
+            and top["cost_usd_hr"] is not None
+            and cheapest_overall["cost_usd_hr"] < top["cost_usd_hr"]
+        ):
+            cheaper_non_native_option = {
+                "gpu_name": cheapest_overall["gpu_name"],
+                "n_gpus_per_instance": cheapest_overall["n_gpus_per_instance"],
+                "replicas": cheapest_overall["replicas"],
+                "total_gpus": cheapest_overall["total_gpus"],
+                "cost_usd_hr": cheapest_overall["cost_usd_hr"],
+                "savings_usd_hr": round(top["cost_usd_hr"] - cheapest_overall["cost_usd_hr"], 4),
+                "note": (
+                    f"{precision} isn't natively accelerated on {cheapest_overall['gpu_name']}; "
+                    "may run via weight-only kernels with lower throughput. Test before "
+                    "relying on it."
+                ),
             }
     else:
         cheapest_fit = {"note": _MULTI_NODE_NOTE}
@@ -619,9 +728,9 @@ def compute_fit(
             "attention — could be several times low if the model uses classic "
             "multi-head attention. See kv_mb_per_token_range for the spread."
         )
-    if any(c["gpu_name"] == "A100 SXM4" for c in serving_configs):
+    if any(c["gpu_name"] == "A100 SXM4" for c in working_configs):
         caveats.append("A100 SXM4 assumed as the 80GB variant; a 40GB variant also exists in the market.")
-    if any(c["n_gpus_per_instance"] > 1 for c in serving_configs):
+    if any(c["n_gpus_per_instance"] > 1 for c in working_configs):
         caveats.append(
             "Multi-GPU throughput doesn't scale linearly with GPU count; interconnect "
             "(NVLink within a node) matters."
@@ -635,10 +744,30 @@ def compute_fit(
         )
     caveats.append("Ornn tracks only these 5 accelerators — a spot index, not the full hardware market.")
 
+    if include_all_configurations:
+        visible_configurations = configurations
+        ruled_out = None
+    else:
+        _TOP_N = 5
+        top_working = working_configs[:_TOP_N]
+        kept_keys = {(c["gpu_name"], c["n_gpus_per_instance"]) for c in top_working}
+        visible_configurations = top_working
+        ruled_out = [
+            {
+                "gpu_name": c["gpu_name"],
+                "n_gpus_per_instance": c["n_gpus_per_instance"],
+                "status": c["status"],
+                "reason": _ruled_out_reason(c, precision),
+            }
+            for c in configurations
+            if (c["gpu_name"], c["n_gpus_per_instance"]) not in kept_keys
+        ]
+
     result: dict[str, Any] = {
         "model": resolved_model_name or model,
         "self_hostable": True,
         "params_b": params_b,
+        "params_source": params_source,
         "precision": precision,
         "assumptions": {
             "bytes_per_param": bytes_per_param,
@@ -657,15 +786,23 @@ def compute_fit(
         "required_gb_with_headroom": round(required_gb_with_headroom, 2),
         "fits_on": fits_on,
         "cheapest_fit": cheapest_fit,
-        "configurations": configurations,
+        "configurations": visible_configurations,
         "caveats": caveats,
     }
 
+    if matched_from is not None:
+        result["matched_from"] = matched_from
+        result["other_candidates"] = other_candidates
+    if ruled_out is not None:
+        result["ruled_out"] = ruled_out
+    if cheaper_non_native_option is not None:
+        result["cheaper_non_native_option"] = cheaper_non_native_option
     if kv_mb_per_token_range is not None:
         result["kv_mb_per_token_range"] = kv_mb_per_token_range
 
     if model_context_window:
         full_window_kv_per_request = kv_bytes_per_token * model_context_window / 1e9
+        visible_keys = {(c["gpu_name"], c["n_gpus_per_instance"]) for c in visible_configurations}
         result["max_context_stress"] = {
             "full_context_window_tokens": int(model_context_window),
             "kv_per_request_at_full_window_gb": round(full_window_kv_per_request, 2),
@@ -676,6 +813,7 @@ def compute_fit(
                     "fits_single_full_window_request": c["kv_pool_gb"] >= full_window_kv_per_request,
                 }
                 for c in configurations
+                if (c["gpu_name"], c["n_gpus_per_instance"]) in visible_keys
             ],
         }
 

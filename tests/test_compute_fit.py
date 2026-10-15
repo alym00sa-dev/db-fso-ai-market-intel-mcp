@@ -133,7 +133,9 @@ def test_t4_1x_b200_bf16():
 
 
 def test_t5_2x_h100_bf16_does_not_load():
-    result = cf.compute_fit(**LLAMA, precision="bf16")
+    # include_all_configurations=True: a does_not_load config won't be in the
+    # default top-5-working view (see round 2's output-shortening fix).
+    result = cf.compute_fit(**LLAMA, precision="bf16", include_all_configurations=True)
     cfg = _config(result, "H100 SXM", 2)
     assert cfg["kv_pool_gb"] < 0
     assert cfg["status"] == "does_not_load"
@@ -280,9 +282,13 @@ def test_lookup_suggests_close_matches_on_total_miss(stub_describe_dataset, stub
 
 
 def test_t15_ambiguous_name_raises(stub_describe_dataset, stub_query_dataset):
+    # Genuinely ambiguous: both rows have the same number of "extra" tokens
+    # beyond the query ("instruct" / "chat"), so neither wins on match
+    # closeness, AND they're different weights (different params_total_b), so
+    # this isn't the auto-pickable "same weights, different mode" case either.
     rows = [
         LLAMA_ROW,
-        {**LLAMA_ROW, "name": "Llama 3.3 Instruct 70B Turbo", "slug": "llama-3-3-instruct-70b-turbo"},
+        {**LLAMA_ROW, "name": "Llama 3.3 Chat 70B", "slug": "llama-3-3-chat-70b", "params_total_b": 68.0},
     ]
     stub_describe_dataset(cf, {"model_benchmarks": LLAMA_BENCHMARK_COLUMNS})
     stub_query_dataset(
@@ -291,6 +297,24 @@ def test_t15_ambiguous_name_raises(stub_describe_dataset, stub_query_dataset):
     )
     with pytest.raises(cf.ComputeFitError):
         cf.compute_fit(model="llama 3.3 70b")
+
+
+def test_tied_variant_with_identical_weights_auto_picks(stub_describe_dataset, stub_query_dataset):
+    # Reasoning/non-reasoning (or effort-level) variants of the SAME weights
+    # tie on match closeness but share params_total_b/params_active_b/
+    # context_window_tokens -> safe to auto-pick rather than force a choice.
+    rows = [
+        {**LLAMA_ROW, "name": "Llama 3.3 Instruct 70B (Reasoning)", "slug": "llama-3-3-instruct-70b-r"},
+        {**LLAMA_ROW, "name": "Llama 3.3 Instruct 70B (Non-reasoning)", "slug": "llama-3-3-instruct-70b-nr"},
+    ]
+    stub_describe_dataset(cf, {"model_benchmarks": LLAMA_BENCHMARK_COLUMNS})
+    stub_query_dataset(
+        cf,
+        {"ornn_gpu_prices": GPU_PRICE_ROWS, "model_benchmarks": _model_benchmarks_route(rows)},
+    )
+    result = cf.compute_fit(model="llama 3.3 70b")
+    assert result["model"] in {"Llama 3.3 Instruct 70B (Reasoning)", "Llama 3.3 Instruct 70B (Non-reasoning)"}
+    assert len(result["other_candidates"]) == 1
 
 
 # --- T16: model= lookup without context_length defaults to 8192 ---
@@ -409,12 +433,38 @@ def test_architecture_override_resolves_for_real_llama_slug(stub_describe_datase
     assert "kv_mb_per_token_range" not in result  # exact formula used, not the estimate
 
 
-# --- Regression: precision-native warning must be visible ON the recommendation,
-# not just in the generic caveats list (A100 isn't fp8-native) ---
+def test_params_total_b_override_corrects_rounded_dataset_value(stub_describe_dataset, stub_query_dataset):
+    # model_benchmarks lists 70.0B (rounded); the override file's 70.55 (the
+    # real count, confirmed against the HF model card) should win, reported
+    # via params_source.
+    stub_describe_dataset(cf, {"model_benchmarks": LLAMA_BENCHMARK_COLUMNS})
+    stub_query_dataset(
+        cf,
+        {
+            "ornn_gpu_prices": GPU_PRICE_ROWS,
+            "model_benchmarks": _model_benchmarks_route([LLAMA_ROW]),
+        },
+    )
+    result = cf.compute_fit(model="Llama 3.3 Instruct 70B", precision="fp8")
+    assert result["params_b"] == 70.55
+    assert result["params_source"] == "local_override"
+    assert result["weights_gb"] == pytest.approx(70.55, abs=0.01)
 
 
-def test_precision_warning_on_recommendation_not_just_caveats():
-    # Price A100 far cheaper than everything else so it would win on cost alone.
+def test_params_source_user_supplied_when_params_b_passed_directly():
+    result = cf.compute_fit(params_b=7)
+    assert result["params_source"] == "user_supplied"
+
+
+# --- Round 2 fix: cheapest_fit must PREFER native-precision hardware even
+# when a non-native GPU is cheaper — the cheaper option is surfaced
+# separately (cheaper_non_native_option), never as the silent headline ---
+
+
+def test_cheapest_fit_prefers_native_precision_over_cheaper_non_native():
+    import unittest.mock as mock
+
+    # A100 (non-native for fp8) is far cheaper than every native GPU.
     prices = {
         "dataset": "ornn_gpu_prices",
         "columns": ["date", "gpu_name", "index_value_usd_hr"],
@@ -426,18 +476,27 @@ def test_precision_warning_on_recommendation_not_just_caveats():
             {"date": "2026-09-01", "gpu_name": "RTX 5090", "index_value_usd_hr": 99.0},
         ],
     }
-    import unittest.mock as mock
-
     with mock.patch.object(cf.retrieval, "query_dataset", return_value=prices):
         result = cf.compute_fit(params_b=7, precision="fp8", batch_size=1)
-    assert result["cheapest_fit"].get("gpu_name") == "A100 SXM4"
-    assert "note" in result["cheapest_fit"]
-    assert "fp8" in result["cheapest_fit"]["note"]
-    assert "natively accelerated" in result["cheapest_fit"]["note"]
+
+    # Headline must be a native GPU, not the cheaper A100.
+    assert result["cheapest_fit"].get("gpu_name") != "A100 SXM4"
+    assert result["cheapest_fit"].get("gpu_name") in {"H100 SXM", "H200", "B200", "RTX 5090"}
+
+    # The cheaper non-native option is surfaced separately, not hidden.
+    assert result["cheaper_non_native_option"]["gpu_name"] == "A100 SXM4"
+    assert result["cheaper_non_native_option"]["savings_usd_hr"] > 0
+    assert "fp8" in result["cheaper_non_native_option"]["note"]
+
+
+def test_no_cheaper_non_native_option_when_native_is_already_cheapest():
+    # fp16 is native everywhere, so there's nothing non-native to surface.
+    result = cf.compute_fit(params_b=7, precision="fp16")
+    assert "cheaper_non_native_option" not in result
 
 
 def test_precision_native_field_on_every_configuration():
-    result = cf.compute_fit(params_b=7, precision="fp8")
+    result = cf.compute_fit(params_b=7, precision="fp8", include_all_configurations=True)
     a100_cfg = _config(result, "A100 SXM4", 1)
     h100_cfg = _config(result, "H100 SXM", 1)
     assert a100_cfg["precision_native"] is False
@@ -449,7 +508,7 @@ def test_precision_native_field_on_every_configuration():
 
 
 def test_consumer_gpu_never_sharded():
-    result = cf.compute_fit(params_b=7, precision="fp16")
+    result = cf.compute_fit(params_b=7, precision="fp16", include_all_configurations=True)
     rtx_shards = {c["n_gpus_per_instance"] for c in result["configurations"] if c["gpu_name"] == "RTX 5090"}
     assert rtx_shards == {1}
 
@@ -460,7 +519,7 @@ def test_consumer_gpu_never_sharded():
 
 def test_serves_with_replicas_status_not_literally_failing():
     kwargs = {**LLAMA, "batch_size": 30}
-    result = cf.compute_fit(**kwargs, precision="fp8")
+    result = cf.compute_fit(**kwargs, precision="fp8", include_all_configurations=True)
     cfg = _config(result, "H100 SXM", 2)  # serves 25 alone; needs 2 replicas for 30
     assert cfg["status"] == "serves_with_replicas"
     assert cfg["replicas"] == 2
@@ -468,7 +527,7 @@ def test_serves_with_replicas_status_not_literally_failing():
 
 
 def test_weights_share_note_absent_when_does_not_load():
-    result = cf.compute_fit(**LLAMA, precision="bf16")
+    result = cf.compute_fit(**LLAMA, precision="bf16", include_all_configurations=True)
     cfg = _config(result, "H100 SXM", 2)  # does_not_load per T5
     assert cfg["status"] == "does_not_load"
     assert not any("little room" in n for n in cfg["notes"])
@@ -478,6 +537,58 @@ def test_weights_share_note_absent_when_does_not_load():
 
 
 def test_configurations_sorted_serving_first_then_by_cost():
-    result = cf.compute_fit(**LLAMA, precision="fp8")
+    result = cf.compute_fit(**LLAMA, precision="fp8", include_all_configurations=True)
     statuses = [cf._STATUS_PRIORITY[c["status"]] for c in result["configurations"]]
     assert statuses == sorted(statuses)
+
+
+# --- Round 2 fix: shorten the default output (top 5 + ruled_out) ---
+
+
+def test_default_output_is_trimmed_to_top_5_with_ruled_out():
+    result = cf.compute_fit(**LLAMA, precision="fp8")
+    assert len(result["configurations"]) <= 5
+    assert all(c["status"] in cf._WORKING_STATUSES for c in result["configurations"])
+    assert "ruled_out" in result
+    for entry in result["ruled_out"]:
+        assert set(entry.keys()) == {"gpu_name", "n_gpus_per_instance", "status", "reason"}
+
+
+def test_include_all_configurations_returns_everything_no_ruled_out():
+    trimmed = cf.compute_fit(**LLAMA, precision="fp8")
+    full = cf.compute_fit(**LLAMA, precision="fp8", include_all_configurations=True)
+    assert len(full["configurations"]) > len(trimmed["configurations"])
+    assert "ruled_out" not in full
+
+
+def test_max_context_stress_matches_visible_configurations(stub_describe_dataset, stub_query_dataset):
+    stub_describe_dataset(cf, {"model_benchmarks": LLAMA_BENCHMARK_COLUMNS})
+    stub_query_dataset(
+        cf,
+        {
+            "ornn_gpu_prices": GPU_PRICE_ROWS,
+            "model_benchmarks": _model_benchmarks_route([LLAMA_ROW]),
+        },
+    )
+    result = cf.compute_fit(model="Llama 3.3 Instruct 70B", precision="fp8")
+    visible = {(c["gpu_name"], c["n_gpus_per_instance"]) for c in result["configurations"]}
+    stress = {(c["gpu_name"], c["n_gpus_per_instance"]) for c in result["max_context_stress"]["configurations"]}
+    assert stress == visible
+
+
+# --- Item 1 acceptance table: a bare "llama 70b" (no version) must never
+# silently resolve to any specific Llama release ---
+
+
+def test_bare_version_query_raises_rather_than_guessing(stub_describe_dataset, stub_query_dataset):
+    rows = [
+        LLAMA_ROW,
+        {**LLAMA_ROW, "name": "Llama 3.1 Instruct 70B", "slug": "llama-3-1-instruct-70b", "params_total_b": 70.6},
+    ]
+    stub_describe_dataset(cf, {"model_benchmarks": LLAMA_BENCHMARK_COLUMNS})
+    stub_query_dataset(
+        cf,
+        {"ornn_gpu_prices": GPU_PRICE_ROWS, "model_benchmarks": _model_benchmarks_route(rows)},
+    )
+    with pytest.raises(cf.ComputeFitError):
+        cf.compute_fit(model="llama 70b")

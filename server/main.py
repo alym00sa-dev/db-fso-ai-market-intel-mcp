@@ -1,8 +1,47 @@
 import os
+import subprocess
+import tomllib
+from datetime import datetime, timezone
+from pathlib import Path
 
 from fastmcp import FastMCP
 
 from server import analysis, compute_fit, equity, retrieval, scorecard
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _resolve_version() -> str:
+    """Best-effort build identifier, so a deployed instance's code can be
+    confirmed against the latest commit rather than guessed at. Checked in
+    order: an env var set at deploy time, the git commit in the deployed
+    checkout, then the package version as a last resort."""
+    for env_var in ("GIT_COMMIT", "SOURCE_VERSION", "DATABRICKS_APP_GIT_COMMIT"):
+        value = os.environ.get(env_var)
+        if value:
+            return value[:12]
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        with open(_REPO_ROOT / "pyproject.toml", "rb") as f:
+            data = tomllib.load(f)
+        return f"v{data['project']['version']} (no git sha available)"
+    except (OSError, KeyError, tomllib.TOMLDecodeError):
+        return "unknown"
+
+
+_VERSION = _resolve_version()
+_STARTED_AT = datetime.now(timezone.utc).isoformat()
 
 INSTRUCTIONS = """\
 AI Market Intelligence over fso_market_intelligence.frontier_labs (16 datasets).
@@ -42,9 +81,16 @@ mcp = FastMCP("fso-ai-market-intel-mcp", instructions=INSTRUCTIONS)
 
 
 @mcp.tool()
-def health() -> str:
-    """Report that the server is up and reachable."""
-    return "ok"
+def health() -> dict[str, str]:
+    """Report that the server is up and reachable, and which build is deployed.
+
+    `version` is the git commit short SHA where available (falling back to an
+    env var set at deploy time, then the package version) — use it to confirm
+    a deployed instance is actually running the code you think it is.
+    `deployed_at` is when this process started, not a redeploy-tracking
+    timestamp from the platform itself.
+    """
+    return {"status": "ok", "version": _VERSION, "deployed_at": _STARTED_AT}
 
 
 mcp.tool(retrieval.list_datasets)

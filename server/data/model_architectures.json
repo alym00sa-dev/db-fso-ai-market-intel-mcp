@@ -4,6 +4,7 @@
     "num_kv_heads": 8,
     "head_dim": 128,
     "num_attention_heads": 64,
-    "source": "meta-llama/Llama-3.3-70B-Instruct config.json"
+    "params_total_b": 70.55,
+    "source": "meta-llama/Llama-3.3-70B-Instruct config/model card — model_benchmarks lists 70.0B (rounded)"
   }
 }
